@@ -2052,6 +2052,7 @@ int ff_index_search_timestamp(const AVIndexEntry *entries, int nb_entries,
     }
     m = (flags & AVSEEK_FLAG_BACKWARD) ? a : b;
 
+    // fixme: 这里重置为了0？
     if (!(flags & AVSEEK_FLAG_ANY))
         while (m >= 0 && m < nb_entries &&
                !(entries[m].flags & AVINDEX_KEYFRAME))
@@ -2194,6 +2195,10 @@ int ff_seek_frame_binary(AVFormatContext *s, int stream_index,
                     " dts_max=%s\n", pos_max, pos_limit, av_ts2str(ts_max));
         }
     }
+    printf("ff_seek_frame_binary st->index_entries:%d target_ts:%d pos_min:%d pos_max:%d pos_limit:%d ts_min:%d ts_max:%d\n",
+           !!st->index_entries,
+           target_ts, pos_min, pos_max, pos_limit, ts_min, ts_max
+           );
 
     pos = ff_gen_search(s, stream_index, target_ts, pos_min, pos_max, pos_limit,
                         ts_min, ts_max, flags, &ts, avif->read_timestamp);
@@ -2383,8 +2388,10 @@ static int seek_frame_generic(AVFormatContext *s, int stream_index,
     AVIndexEntry *ie;
 
     st = s->streams[stream_index];
+    printf("seek_frame_generic: st->nb_index_entries:%d\n", st->nb_index_entries);
 
     index = av_index_search_timestamp(st, timestamp, flags);
+    printf("seek_frame_generic: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
 
     if (index < 0 && st->nb_index_entries &&
         timestamp < st->index_entries[0].timestamp)
@@ -2401,14 +2408,19 @@ static int seek_frame_generic(AVFormatContext *s, int stream_index,
                 return ret;
             ff_update_cur_dts(s, st, ie->timestamp);
         } else {
+            printf("seek_frame_generic: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
             if ((ret = avio_seek(s->pb, s->internal->data_offset, SEEK_SET)) < 0)
                 return ret;
+            printf("seek_frame_generic: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
         }
         av_packet_unref(pkt);
+        printf("seek_frame_generic: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
         for (;;) {
             int read_status;
             do {
+//                printf("seek_frame_generic before av_read_frame: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
                 read_status = av_read_frame(s, pkt);
+//                printf("seek_frame_generic before av_read_frame: st->nb_index_entries:%d index:%d\n", st->nb_index_entries, index);
             } while (read_status == AVERROR(EAGAIN));
             if (read_status < 0)
                 break;
@@ -2435,9 +2447,11 @@ static int seek_frame_generic(AVFormatContext *s, int stream_index,
         if (s->iformat->read_seek(s, stream_index, timestamp, flags) >= 0)
             return 0;
     ie = &st->index_entries[index];
+    printf("seek_frame_generic before avio_seek s->pb->pos:%d\n", s->pb->pos);
     if ((ret = avio_seek(s->pb, ie->pos, SEEK_SET)) < 0)
         return ret;
     ff_update_cur_dts(s, st, ie->timestamp);
+    printf("seek_frame_generic after avio_seek s->pb->pos:%d ie->pos:%d\n", s->pb->pos, ie->pos);
 
     return 0;
 }
@@ -2462,8 +2476,10 @@ static int seek_frame_internal(AVFormatContext *s, int stream_index,
 
         st = s->streams[stream_index];
         /* timestamp for default must be expressed in AV_TIME_BASE units */
+        printf("before av_rescale:%d\n", timestamp);
         timestamp = av_rescale(timestamp, st->time_base.den,
                                AV_TIME_BASE * (int64_t) st->time_base.num);
+        printf("after av_rescale:%d\n", timestamp);
     }
 
     /* first, we try the format specific seek */
@@ -2512,6 +2528,7 @@ int av_seek_frame(AVFormatContext *s, int stream_index,
 int avformat_seek_file(AVFormatContext *s, int stream_index, int64_t min_ts,
                        int64_t ts, int64_t max_ts, int flags)
 {
+    printf("avformat_seek_file: stream_index:%d ts:%d flags:%d\n", stream_index), ts, flags;
     if (min_ts > ts || max_ts < ts)
         return -1;
     if (stream_index < -1 || stream_index >= (int)s->nb_streams)
@@ -2527,7 +2544,9 @@ int avformat_seek_file(AVFormatContext *s, int stream_index, int64_t min_ts,
 
         if (stream_index == -1 && s->nb_streams == 1) {
             AVRational time_base = s->streams[0]->time_base;
+            printf("before av_rescale_q:%d\n", ts);
             ts = av_rescale_q(ts, AV_TIME_BASE_Q, time_base);
+            printf("after av_rescale_q:%d\n", ts);
             min_ts = av_rescale_rnd(min_ts, time_base.den,
                                     time_base.num * (int64_t)AV_TIME_BASE,
                                     AV_ROUND_UP   | AV_ROUND_PASS_MINMAX);

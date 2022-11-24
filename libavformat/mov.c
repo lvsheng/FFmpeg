@@ -7844,6 +7844,7 @@ fail:
     return err;
 }
 
+// todo: mov_find_next_sample method is private
 static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
 {
     AVIndexEntry *sample = NULL;
@@ -8108,6 +8109,7 @@ static int mov_seek_fragment(AVFormatContext *s, AVStream *st, int64_t timestamp
     MOVContext *mov = s->priv_data;
     int index;
 
+    // 是因为这里提前return了？
     if (!mov->frag_index.complete)
         return 0;
 
@@ -8130,7 +8132,9 @@ static int mov_seek_stream(AVFormatContext *s, AVStream *st, int64_t timestamp, 
 
     // Here we consider timestamp to be PTS, hence try to offset it so that we
     // can search over the DTS timeline.
+    printf("mov_seek_stream before timestamp fix: %d\n", timestamp);
     timestamp -= (sc->min_corrected_pts + sc->dts_shift);
+    printf("mov_seek_stream after timestamp fix: %d\n", timestamp);
 
     ret = mov_seek_fragment(s, st, timestamp);
     if (ret < 0)

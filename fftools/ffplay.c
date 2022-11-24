@@ -49,6 +49,16 @@
 #include "libavcodec/avfft.h"
 #include "libswresample/swresample.h"
 
+#include "libavformat/avformat.h"
+//#include "libavformat/internal.h"
+#include "libavutil/timestamp.h"
+#include "libavformat/isom.h"
+#include <unistd.h>
+#include "libavutil/mathematics.h"
+#include <sys/time.h>
+#include <time.h>
+#include <stdio.h>
+
 #if CONFIG_AVFILTER
 # include "libavfilter/avfilter.h"
 # include "libavfilter/buffersink.h"
@@ -318,6 +328,8 @@ static int screen_height = 0;
 static int screen_left = SDL_WINDOWPOS_CENTERED;
 static int screen_top = SDL_WINDOWPOS_CENTERED;
 static int audio_disable;
+static int calculate_audio_offset;
+static int calculate_video_offset;
 static int video_disable;
 static int subtitle_disable;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
@@ -2751,6 +2763,58 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
+static size_t ibuf_size = 4096;
+static int total = 0;
+static int fsize(FILE *fp){
+    int prev=ftell(fp);
+    fseek(fp, 0L, SEEK_END);
+    int sz=ftell(fp);
+    fseek(fp,prev,SEEK_SET); //go back to where we were
+    return sz;
+}
+
+static size_t read_packet(void *opaque, uint8_t *buf, int buf_size)
+{
+    if (buf_size > ibuf_size) buf_size = ibuf_size;
+    FILE *file = opaque;
+
+    int ret = fread(buf, 1, buf_size, file);
+    total += buf_size;
+
+    printf("read_packet: %d %d %d\n", ret, buf_size, total);
+
+    if (ret <= 0) {
+        printf("read_packet fail %d\n", ret);
+        // 这里先不fail，而是sleep，模拟网络加载hanging
+        sleep(60);
+        return -1;
+    }
+    return ret;
+}
+
+static size_t seak_in_file(void *opaque, int64_t offset, int whence)
+{
+    FILE *file = opaque;
+    int64_t ret = -1;
+
+    switch (whence)
+    {
+        case AVSEEK_SIZE:
+            ret = fsize(file);
+            break;
+        case SEEK_SET:
+            ret = fseek(file, offset, SEEK_SET);
+            break;
+    }
+    printf("seak_in_file whence=%d , offset=%lld ret=%d\n", whence, offset, ret);
+    if (ret < 0) {
+        fprintf(stderr, "seek overflow!");
+        sleep(10);
+    }
+    return ret;
+}
+
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -2793,7 +2857,16 @@ static int read_thread(void *arg)
         av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+/*
     err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
+*/
+    // 改为自定义io
+    uint8_t *ibuf = av_malloc(ibuf_size);
+    FILE* file = fopen(is->filename, "r");
+    AVIOContext *avio_in = avio_alloc_context(ibuf, ibuf_size, 0, file, &read_packet, &seak_in_file, NULL);
+    ic->pb = avio_in;
+    err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
+
     if (err < 0) {
         print_error(is->filename, err);
         ret = -1;
@@ -2851,7 +2924,10 @@ static int read_thread(void *arg)
         /* add the stream start time */
         if (ic->start_time != AV_NOPTS_VALUE)
             timestamp += ic->start_time;
+        // start time: seek
+        printf("before avformat_seek_file: timestamp:%lld\n", timestamp);
         ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
+        printf("after avformat_seek_file\n");
         if (ret < 0) {
             av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
                     is->filename, (double)timestamp / AV_TIME_BASE);
@@ -3015,6 +3091,7 @@ static int read_thread(void *arg)
             }
         }
         ret = av_read_frame(ic, pkt);
+//        printf("av_read_frame done.\n");
         if (ret < 0) {
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
                 if (is->video_stream >= 0)
@@ -3041,6 +3118,16 @@ static int read_thread(void *arg)
         /* check if packet is in play range specified by user, then queue, otherwise discard */
         stream_start_time = ic->streams[pkt->stream_index]->start_time;
         pkt_ts = pkt->pts == AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+        int curTime = (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
+                      av_q2d(ic->streams[pkt->stream_index]->time_base) -
+                      (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000;
+        printf("pkt_ts:%d stream_start_time:%d curTime:%d\n", pkt_ts, stream_start_time, curTime);
+        printf("ic->streams[pkt->stream_index]->time_base:%d\n", ic->streams[pkt->stream_index]->time_base);
+        printf("av_q2d(ic->streams[pkt->stream_index]->time_base):%d\n", av_q2d(ic->streams[pkt->stream_index]->time_base));
+        printf("(double)(start_time != AV_NOPTS_VALUE ? start_time : 0):%lf\n", (double)(start_time != AV_NOPTS_VALUE ? start_time : 0));
+        printf("curTime:%d\n", curTime);
+        fflush(stdout);
+        // duration生效机制: 每次读frame判断
         pkt_in_play_range = duration == AV_NOPTS_VALUE ||
                 (pkt_ts - (stream_start_time != AV_NOPTS_VALUE ? stream_start_time : 0)) *
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
@@ -3594,6 +3681,8 @@ static const OptionDef options[] = {
     { "vst", OPT_STRING | HAS_ARG | OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_VIDEO] }, "select desired video stream", "stream_specifier" },
     { "sst", OPT_STRING | HAS_ARG | OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE] }, "select desired subtitle stream", "stream_specifier" },
     { "ss", HAS_ARG, { .func_arg = opt_seek }, "seek to a given position in seconds", "pos" },
+    { "calculate_audio_offset", OPT_BOOL, { &calculate_audio_offset }, "calculate_audio_offset" },
+    { "calculate_video_offset", OPT_BOOL, { &calculate_video_offset }, "calculate_audio_offset" },
     { "t", HAS_ARG, { .func_arg = opt_duration }, "play  \"duration\" seconds of audio/video", "duration" },
     { "bytes", OPT_INT | HAS_ARG, { &seek_by_bytes }, "seek by bytes 0=off 1=on -1=auto", "val" },
     { "seek_interval", OPT_FLOAT | HAS_ARG, { &seek_interval }, "set seek interval for left/right keys, in seconds", "seconds" },
@@ -3679,6 +3768,356 @@ void show_help_default(const char *opt, const char *arg)
            );
 }
 
+/*static AVIndexEntry *find_last_sample_video(AVFormatContext *s)
+{
+    AVIndexEntry *sample = NULL;
+    int stream_index = av_find_default_stream_index(s);
+    printf("av_find_best_stream: %d\n", stream_index);
+
+    int i;
+    i = stream_index;
+    {
+        AVStream *avst = s->streams[i];
+        printf("stream[%d]", i);
+        MOVStreamContext *msc = avst->priv_data;
+        if (msc->pb && msc->current_sample < avst->nb_index_entries) {
+            int target_sample = msc->current_sample + 1;
+            AVIndexEntry *current_sample = &avst->index_entries[target_sample];
+            int64_t dts = av_rescale(current_sample->timestamp, AV_TIME_BASE, msc->time_scale);
+            printf("stream %d, sample %d, dts %"PRId64" pos:%d size:%d\n", i, msc->current_sample, dts, current_sample->pos, current_sample->size);
+            sample = current_sample;
+        }
+    }
+    return sample;
+}*/
+// 参考：mov.c: mov_find_next_sample
+static AVIndexEntry *find_last_sample_video(AVFormatContext *s)
+{
+    AVIndexEntry *sample = NULL;
+    int stream_index = av_find_default_stream_index(s);
+    printf("av_find_best_stream: %d\n", stream_index);
+
+    int i;
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *avst = s->streams[i];
+        printf("stream[%d]", i);
+        MOVStreamContext *msc = avst->priv_data;
+        if (msc->pb && msc->current_sample < avst->nb_index_entries) {
+            AVIndexEntry *current_sample = &avst->index_entries[msc->current_sample];
+            int64_t dts = av_rescale(current_sample->timestamp, AV_TIME_BASE, msc->time_scale);
+            printf("stream %d, sample %d, dts %"PRId64" pos:%d size:%d\n", i, msc->current_sample, dts, current_sample->pos, current_sample->size);
+            if (!sample || current_sample->pos >= sample->pos) { // 取更靠后者(音频/视频等stream都ready)
+                sample = current_sample;
+            }
+        }
+    }
+    return sample;
+}
+
+
+static int calculate_video_bytes_number_by_duration(int duration, const char *filename) {
+    printf("calculate_video_bytes_number_by_duration(%d, %s)\n", duration, filename);
+    struct timeval  tv1, tv2;
+    gettimeofday(&tv1, NULL);
+    clock_t tic = clock();
+
+    int ret;
+    AVFormatContext *avf = NULL;
+
+    if ((ret = avformat_open_input(&avf, filename, NULL, NULL)) < 0) {
+        fprintf(stderr, "%s: %s\n", filename, av_err2str(ret));
+        return 1;
+    }
+//    if ((ret = avformat_find_stream_info(avf, NULL)) < 0) {
+//        fprintf(stderr, "%s: could not find codec parameters: %s\n", filename,
+//                av_err2str(ret));
+//        return 1;
+//    }
+
+    // seek
+    int64_t t = duration + 1000000; // 保证duration内完整播完，seek至下一秒的开始帧
+    ret = avformat_seek_file(avf, -1, INT64_MIN, t, INT64_MAX, AVSEEK_FLAG_ANY);
+    printf("avformat_seek_file(%d):%d\n", t, ret);
+
+    // get sample
+    AVIndexEntry *sample = find_last_sample_video(avf);
+//    printf("nextSample.pos:%d, nextSample.size:%d, file should cut at:%d\n",
+//           sample->pos, sample->size, sample->pos);
+    printf("sample.pos:%d, sample.size:%d, file should cut at:%d\n",
+           sample->pos, sample->size, sample->pos + sample->size);
+//    printf("file should cut at:100\n");
+
+    gettimeofday(&tv2, NULL);
+    clock_t toc = clock();
+    printf("Cpu Time: %f ms\n", (double)(toc - tic) / CLOCKS_PER_SEC * 1000);
+    printf ("Total time = %f ms\n",
+            (double) (tv2.tv_usec - tv1.tv_usec) / 1000 +
+            (double) (tv2.tv_sec - tv1.tv_sec) * 1000);
+    avformat_close_input(&avf);
+    return 0;
+}
+
+static int calculate_audio_bytes_number_by_duration(int duration, const char *filename) {
+    printf("calculate_audio_bytes_number_by_duration(%d-%d, %s)\n", duration / 1000000, duration, filename);
+    struct timeval  tv1, tv2;
+    gettimeofday(&tv1, NULL);
+    clock_t tic = clock();
+
+    int ret;
+    AVFormatContext *avf = NULL;
+
+    if ((ret = avformat_open_input(&avf, filename, NULL, NULL)) < 0) {
+        fprintf(stderr, "%s: %s\n", filename, av_err2str(ret));
+        return 1;
+    }
+    if ((ret = avformat_find_stream_info(avf, NULL)) < 0) {
+        fprintf(stderr, "%s: could not find codec parameters: %s\n", filename,
+                av_err2str(ret));
+        return 1;
+    }
+
+    int default_stream_index = av_find_default_stream_index(avf);
+    printf("av_find_best_stream: %d\n", default_stream_index);
+    AVStream *st = avf->streams[default_stream_index];
+    printf("st->index_entries:%d nb_index_entries:%d\n", !!st->index_entries, st->nb_index_entries);
+
+    int64_t timestamp = duration + 1000000; // 保证duration内完整播完，取下一秒的开始帧
+    int64_t rescaledTimestamp = av_rescale(timestamp, st->time_base.den, AV_TIME_BASE * (int64_t) st->time_base.num);
+    int64_t ts = -1;
+    const AVInputFormat *avif = avf->iformat;
+    printf("AVInputFormat: %s\n", avif->name);
+    printf("read_timestamp: %p\n", avif->read_timestamp);
+
+    int64_t pos;
+    if (avif->read_timestamp) {
+        // 看上去典型是flac有
+        printf("av_rescale result timestamp: %lld\n", rescaledTimestamp);
+        // todo: 试会不会几秒都在一起
+        // 其内部实现是二分查找不断seek并read time后比对
+        pos = ff_gen_search(avf, default_stream_index, rescaledTimestamp, 0, 0, 0,
+                                    AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0, &ts, avif->read_timestamp);
+    } else {
+        // 看上去典型是mp3
+        // 先seek一下，确保解够足够的帧（此时seek内部实现即从头开始顺序解帧）
+        avformat_seek_file(avf, -1, INT64_MIN, timestamp, INT64_MAX, AVSEEK_FLAG_ANY);
+        // 再找当前帧AVIndexEntry
+        int index = av_index_search_timestamp(st, rescaledTimestamp, 0);
+        if (index > 0) {
+            AVIndexEntry *ie = &st->index_entries[index];
+            pos = ie->pos + ie->size;
+            printf("avf->pb->pos:%d ie->pos:%d ie->size:%d pos:%d\n", avf->pb->pos, ie->pos, ie->size, pos);
+        } else {
+            // wav时search失败，读帧
+            AVPacket packet;
+            do {
+                ret = av_read_frame(avf, &packet);
+                printf("av_read_frame:%d\n", ret);
+                AVRational *tb = &avf->streams[packet.stream_index]->time_base;
+                printf("read: %d size=%d stream=%d dts=%s (%s) pts=%s (%s) pos=%d\n",
+                       ret, packet.size, packet.stream_index,
+                       av_ts2str(packet.dts), av_ts2timestr(packet.dts, tb),
+                       av_ts2str(packet.pts), av_ts2timestr(packet.pts, tb), packet.pos
+                );
+                pos = packet.pos + packet.size;
+                // while解决的bad case: 2af26a37f289127e3e7d37cf145b75d2-truncated.wav： 带封面的音乐，可能找到其他stream
+            } while (default_stream_index != -1 && packet.stream_index != default_stream_index);
+        }
+    }
+
+    printf("ff_gen_search result: pos:%lld ts:%lld\n", pos, ts);
+    printf("file should cut at:%d\n", pos);
+
+    avformat_close_input(&avf);
+
+    gettimeofday(&tv2, NULL);
+    clock_t toc = clock();
+    printf("Cpu Time: %f ms\n", (double)(toc - tic) / CLOCKS_PER_SEC * 1000);
+    printf ("Total time = %f ms\n",
+            (double) (tv2.tv_usec - tv1.tv_usec) / 1000 +
+            (double) (tv2.tv_sec - tv1.tv_sec) * 1000);
+    return 0;
+}
+
+//static size_t ibuf_size = 4096;
+static int s_total2 = 0;
+static size_t read_packet_for_seek(void *opaque, uint8_t *buf, int buf_size)
+{
+    if (buf_size > ibuf_size) buf_size = ibuf_size;
+    FILE *file = opaque;
+    int ret = fread(buf, 1, buf_size, file);
+    s_total2 += buf_size;
+
+    printf("read_packet_for_seek: %d %d %d\n", ret, buf_size, s_total2);
+
+    if (ret < 0) {
+        printf("read_packet_for_seek fail %d\n", ret);
+        return -1;
+    }
+    return ret;
+}
+
+/*
+static int fsize(FILE *fp){
+    int prev=ftell(fp);
+    fseek(fp, 0L, SEEK_END);
+    int sz=ftell(fp);
+    fseek(fp,prev,SEEK_SET); //go back to where we were
+    return sz;
+}
+*/
+
+static size_t seak_in_file_for_seek_test(void *opaque, int64_t offset, int whence)
+{
+    FILE *file = opaque;
+    int64_t ret = -1;
+
+    switch (whence)
+    {
+        case AVSEEK_SIZE:
+            ret = fsize(file);
+            break;
+        case SEEK_SET:
+            ret = fseek(file, offset, SEEK_SET);
+            break;
+    }
+    printf("seak_in_file_for_seek_test whence=%d , offset=%lld ret=%d\n", whence, offset, ret);
+    return ret;
+}
+
+//#define VIDEO
+static int try_custom_seek(const char *filename, int ts) {
+    int ret, flags;
+    AVFormatContext *avf = NULL;
+    int64_t min_ts, max_ts;
+    AVPacket packet;
+
+    /*if (filename == NULL) {
+#ifdef VIDEO
+        //    filename = "2018112215b8cb8b03754f62b8474507810a26f8.mp4";
+    filename = "meixiongxiaofuru_h265.mp4";
+#else
+        filename = "0e8e25dcf157c9af84ed41ee17668f95.flac";
+#endif
+    }*/
+
+    AVIOContext *avio_in = NULL;
+    uint8_t *ibuf = NULL;
+
+    FILE* file = fopen(filename, "r");
+    ibuf = av_malloc(ibuf_size);
+
+    AVInputFormat* inputFormat = av_find_input_format("mp4");
+    printf("inputFormat: %p %s\n", inputFormat, inputFormat->name);
+    avio_in = avio_alloc_context(ibuf, ibuf_size, 0, file, &read_packet_for_seek, NULL, &seak_in_file_for_seek_test);
+
+    avf = avformat_alloc_context();
+    avf->pb = avio_in;
+
+#ifdef VIDEO
+    if ((ret = avformat_open_input(&avf, filename, inputFormat, NULL)) < 0) {
+#else
+    if ((ret = avformat_open_input(&avf, filename, NULL, NULL)) < 0) {
+#endif
+        fprintf(stderr, "%s: %s\n", filename, av_err2str(ret));
+        return 1;
+    }
+
+//    int stream = av_find_best_stream(avf, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+//    int stream = av_find_best_stream(avf, AVMEDIA_TYPE_UNKNOWN, -1, -1, NULL, 0);
+    int stream = av_find_default_stream_index(avf);
+    printf("av_find_best_stream: %d\n", stream);
+    AVStream *avst = avf->streams[stream];
+#ifdef VIDEO
+    MOVStreamContext *msc = avst->priv_data;
+    printf("msc->current_sample: %d\n", msc->current_sample);
+#endif
+
+//    if ((ret = avformat_find_stream_info(avf, NULL)) < 0) {
+//        fprintf(stderr, "%s: could not find codec parameters: %s\n", filename,
+//                av_err2str(ret));
+//        return 1;
+//    }
+
+    printf("data_offset: %d %d s->pb->pos:%d\n", avf->internal->data_offset, avf->internal->offset, avf->pb->pos);
+
+//    min_ts = ts = max_ts = 11 * 1000 * 1000;
+//    ts = 9 * 1000 * 1000; // 对视频meixiongxiaofuru_h265，5~9都一样... （几秒都在一个packet里？所以一起读了？）6s从这里开始不代表这之前5s一定够？
+    ts += 1000 * 1000; // 前进1s
+    // fixme: 这里如果传stream，则ts应先用av_rescale转
+    //   seek_frame_internal内只有stream为-1时才自动转
+//    ret = avformat_seek_file(avf, stream, INT64_MIN, ts, INT64_MAX, AVSEEK_FLAG_ANY); // fixme: download.mp4 seek 5不生效
+    ret = avformat_seek_file(avf, -1, INT64_MIN, ts, INT64_MAX, AVSEEK_FLAG_ANY); // fixme: download.mp4 seek 5不生效
+    printf("avformat_seek_file:%d ret:%d\n", ts, ret);
+//    printf("data_offset: %d %d s->pb->pos:%d\n", avf->internal->data_offset, avf->internal->offset, avf->pb->pos);
+#ifdef VIDEO
+    printf("msc->current_sample: %d\n", msc->current_sample);
+    AVIndexEntry *sample = find_last_sample_video(avf);
+    printf("sample.pos:%d, sample.size:%d, file should cut at:%d\n", sample->pos, sample->size, sample->pos + sample->size);
+    int64_t dts = av_rescale(sample->timestamp, AV_TIME_BASE, msc->time_scale);
+    printf(">>>sample %d, sample->timestamp:%d dts %"PRId64" pos:%d size:%d\n",
+           msc->current_sample, sample->timestamp,  dts, sample->pos, sample->size);
+#endif
+
+    ret = av_read_frame(avf, &packet);
+    printf("av_read_frame:%d\n", ret);
+//    printf("data_offset: %d %d s->pb->pos:%d\n", avf->internal->data_offset, avf->internal->offset, avf->pb->pos);
+
+    AVRational *tb = &avf->streams[packet.stream_index]->time_base;
+    printf("read: %d size=%d stream=%d dts=%s (%s) pts=%s (%s) pos=%d\n",
+           ret, packet.size, packet.stream_index,
+           av_ts2str(packet.dts), av_ts2timestr(packet.dts, tb),
+           av_ts2str(packet.pts), av_ts2timestr(packet.pts, tb), packet.pos
+           );
+//    printf("data_offset: %d %d s->pb->pos:%d\n", avf->internal->data_offset, avf->internal->offset, avf->pb->pos);
+
+    av_packet_unref(&packet);
+    avformat_close_input(&avf);
+    return 0;
+}
+
+/*
+int try_seek_offset() {
+    int opt, ret, stream, flags;
+    const char *filename;
+    AVFormatContext *avf = NULL;
+    int64_t min_ts, max_ts, ts;
+    AVPacket packet;
+
+    filename = "2018112215b8cb8b03754f62b8474507810a26f8.mp4";
+
+    if ((ret = avformat_open_input(&avf, filename, NULL, NULL)) < 0) {
+        fprintf(stderr, "%s: %s\n", filename, av_err2str(ret));
+        return 1;
+    }
+    if ((ret = avformat_find_stream_info(avf, NULL)) < 0) {
+        fprintf(stderr, "%s: could not find codec parameters: %s\n", filename,
+                av_err2str(ret));
+        return 1;
+    }
+
+    stream = 0;
+    min_ts = 5;
+    ts = 5;
+    max_ts = 5;
+    flags = 0;
+    ret = avformat_seek_file(avf, stream, min_ts, ts, max_ts, flags);
+    printf("avformat_seek_file:%d\n", ret);
+
+    ret = av_read_frame(avf, &packet);
+    printf("av_read_frame:%d\n", ret);
+    AVRational *tb = &avf->streams[packet.stream_index]->time_base;
+    printf("read: %d size=%d stream=%d dts=%s (%s) pts=%s (%s) pos=%d\n",
+           ret, packet.size, packet.stream_index,
+           av_ts2str(packet.dts), av_ts2timestr(packet.dts, tb),
+           av_ts2str(packet.pts), av_ts2timestr(packet.pts, tb), packet.pos
+           );
+
+    av_packet_unref(&packet);
+    avformat_close_input(&avf);
+    return 0;
+}
+*/
+
 /* Called from the main */
 int main(int argc, char **argv)
 {
@@ -3711,6 +4150,17 @@ int main(int argc, char **argv)
         av_log(NULL, AV_LOG_FATAL,
                "Use -h to get full help or, even better, run 'man %s'\n", program_name);
         exit(1);
+    }
+
+//    try_custom_seek(input_filename, start_time);
+//    return 0;
+
+    if (calculate_audio_offset) {
+        calculate_audio_bytes_number_by_duration(start_time, input_filename);
+        return 0;
+    } else if (calculate_video_offset) {
+        calculate_video_bytes_number_by_duration(start_time, input_filename);
+        return 0;
     }
 
     if (display_disable) {

@@ -258,6 +258,7 @@ int64_t avio_seek(AVIOContext *s, int64_t offset, int whence)
     int buffer_size;
     int short_seek;
     whence &= ~AVSEEK_FORCE;
+//    printf("avio_seek: %d %lld\n", whence, offset);
 
     if(!s)
         return AVERROR(EINVAL);
